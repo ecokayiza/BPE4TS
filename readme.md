@@ -57,19 +57,7 @@ Make sure you have [uv](https://github.com/astral-sh/uv) installed.
     - **Metric**: "Distance to Ideal" heuristic ($\sqrt{MSE_{norm}^2 + (1-Compression_{norm})^2}$).
     - **Strategy**: 2-Stage Search (Coarse Grid -> Fine Local Search).
 
-## 📊 Experiment Results (实验结果)
-
 **Dataset**: ETTm1 (Univariate 'OT' column - Oil Temperature).
-
-### Best Configuration (最佳模型配置)
-After an automated Coarse-to-Fine search:
-- **Bins**: **55**
-- **Strategy**: **Uniform Fixed**
-- **Min Frequency**: **2**
-
-### Performance Metrics (性能指标)
-- **Reconstruction MSE**: **0.002784** (Very high fidelity)
-- **Compression Ratio**: **~8.9x** (Significant reduction in sequence length)
 
 ### Visualizations (可视化解读)
 
@@ -89,4 +77,3 @@ After an automated Coarse-to-Fine search:
 
 1.  **Uniform Strategy Wins**: on this normalized dataset, simple uniform binning proved more robust for balancing compression and error compared to quantile binning (which is often too granular).
 2.  **Adaptive Length**: The BPE successfully identified motifs of varying lengths. Stable regions are compressed into single "long tokens", while noisy regions use "short tokens".
-3.  **Fine-Tuning Matters**: The 2-stage search successfully refined the bin count from a coarse 50 to a precise 55, improving the trade-off metrics.

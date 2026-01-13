@@ -1,3 +1,18 @@
+"""
+Time Series BPE Tokenizer Module.
+---------------------------------
+This module implements Byte Pair Encoding (BPE) specifically adjusted for
+time series discretization tokens. It learns to merge frequent adjacent pairs
+of tokens into new symbols, effectively discovering "Motifs" of variable length.
+
+Public Classes:
+- TimeSeriesBPE: 
+    Main class for training and applying BPE.
+    Methods: train(), encode(), decode(), decode_token().
+
+Dependencies: numpy, collections, tqdm
+"""
+
 import collections
 from tqdm import tqdm
 import numpy as np
@@ -33,10 +48,11 @@ class TimeSeriesBPE:
                 i += 1
         return v_out
 
-    def train(self, data_tokens: list, max_steps: int = None, min_freq: int = 0):
+    def train(self, data_tokens: list, max_steps: int = None, min_freq: int = 0, verbose: bool = True):
         """
         data_tokens: list of integers (initial discretized tokens)
         min_freq: stop merging if frequency of best pair is less than min_freq (P_min)
+        verbose: show progress bar
         """
         # We work with a list of integers
         ids = list(data_tokens)
@@ -44,26 +60,30 @@ class TimeSeriesBPE:
         target_size = self.vocab_size
         num_merges = target_size - self.initial_vocab_size
         
-        if max_steps:
-             num_merges = min(num_merges, max_steps)
-
-        pbar = tqdm(range(num_merges), desc="Training BPE")
-        for i in pbar:
+        # Determine loop limit
+        if max_steps is not None:
+            num_merges = min(num_merges, max_steps)
+            
+        # Progress bar: Use total only if max_steps is explicit, otherwise indefinite
+        pbar_total = max_steps if max_steps is not None else None
+        pbar = tqdm(total=pbar_total, desc="Training BPE", disable=not verbose)
+        
+        for i in range(num_merges):
             stats = self.get_stats(ids)
             if not stats:
-                print("No more pairs to merge.")
                 break
-            
-            # Find most frequent pair
+                
             best_pair = max(stats, key=stats.get)
-            best_freq = stats[best_pair]
-
-            if best_freq < min_freq:
-                print(f"Stopping: Best pair frequency {best_freq} < {min_freq}")
+            
+            # Robustness Check: Minimum Frequency
+            if stats[best_pair] < min_freq:
+                if verbose:
+                    print(f"Stopping: Best pair frequency {stats[best_pair]} < {min_freq}")
                 break
             
-            # Assign new token ID
-            new_id = self.current_vocab_count
+            # Create new token
+            new_id = self.initial_vocab_size + len(self.rules)
+            
             self.rules[new_id] = best_pair
             self.pair_to_token[best_pair] = new_id
             self.current_vocab_count += 1
@@ -71,8 +91,10 @@ class TimeSeriesBPE:
             # Merge
             ids = self.merge_vocab(best_pair, ids)
             
+            pbar.update(1)
             pbar.set_postfix({"stats_len": len(stats), "freq": stats[best_pair], "new_id": new_id})
 
+        pbar.close()
         return ids
 
     def encode(self, data_tokens: list):
@@ -80,22 +102,25 @@ class TimeSeriesBPE:
         Apply learned merges to new data
         """
         ids = list(data_tokens)
-        # We need to apply merges in the same order they were learned (by ID value)
-        # Since ids are assigned sequentially, we can just iterate through our rules sorted by ID.
+        
+        # We must apply merges in the SAME ORDER they were learned. 
+        # But efficiently, we just iterate through our learned rules in order of creation.
+        # Since rules indices are sequential, we iterate from init_vocab to current.
+        
         sorted_rules = sorted(self.rules.items(), key=lambda x: x[0])
         
         for new_id, pair in sorted_rules:
             ids = self.merge_vocab(pair, ids)
             
         return ids
-
+    
     def decode_token(self, token_id):
         """
-        Recursive decoding of a single token back to base tokens.
+        Recursively expand a token into its base tokens (leaves).
         """
         if token_id < self.initial_vocab_size:
             return [token_id]
-        
+            
         if token_id not in self.rules:
             # Should not happen in consistent state
             return [token_id]

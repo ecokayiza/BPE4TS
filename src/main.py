@@ -1,17 +1,43 @@
+"""
+Main Pipeline Module.
+---------------------
+Orchestrates the Time Series BPE experiments.
+1. Loads ETTm1 data.
+2. Preprocesses (Normalizes/Clips).
+3. Runs Grid Search (Phased: Coarse -> Fine).
+4. Selects Best Model using Unsupervised Grammar Metrics (Perplexity).
+5. Generates comprehensive visualizations.
+
+Manual Usage:
+    >>> from src.main import run_experiment
+    >>> res = run_experiment(series, n_bins=50, strategy='uniform_fixed', min_freq=50)
+
+Dependencies: pandas, numpy, src.*
+"""
+
 import numpy as np
 import pandas as pd
+import os
+import time
+import warnings
+
 from src.data_loader import load_data, get_series
 from src.discretizer import TimeSeriesDiscretizer
 from src.tokenizer import TimeSeriesBPE
-from src.metrics_entropy import calculate_grammar_quality
-from src.visualization import plot_pareto_frontier, plot_detailed_tokenization, plot_tokenization_gallery
-import os
+from src.metrics import calculate_grammar_quality, calculate_motif_quality
+from src.visualization import (
+    plot_pareto_frontier, 
+    plot_detailed_tokenization, 
+    plot_tokenization_gallery
+)
 
+# Configuration
 RESULT_DIR = "result"
-if not os.path.exists(RESULT_DIR):
-    os.makedirs(RESULT_DIR)
-    
-GRID_RESULTS_PATH = os.path.join(RESULT_DIR, "experiment_grid_results.csv")
+GRID_RESULTS_PATH = os.path.join(RESULT_DIR, "experiment_grid_results_motif.csv")
+
+def ensure_result_dir():
+    if not os.path.exists(RESULT_DIR):
+        os.makedirs(RESULT_DIR)
 
 def run_experiment(
     series, 
@@ -21,28 +47,38 @@ def run_experiment(
     train_ratio=0.8,
     return_models=False
 ):
+    """
+    Runs a single BPE experiment:
+    1. Discretizes train/test data.
+    2. Trains BPE on train set.
+    3. Evaluates on test set (Reconstruction MSE, Compression, Grammar Quality).
+    """
+    # Split
     series_len = len(series)
     train_len = int(series_len * train_ratio)
     train_data = series[:train_len]
     test_data = series[train_len:]
 
     # 1. Discretization
-    if strategy == 'uniform_fixed':
-        discretizer = TimeSeriesDiscretizer(n_bins=n_bins, strategy='uniform_fixed', range_min=-5.0, range_max=5.0)
-    elif strategy == 'gaussian':
-        discretizer = TimeSeriesDiscretizer(n_bins=n_bins, strategy='gaussian', range_min=-5.0, range_max=5.0)
-    else:
-        discretizer = TimeSeriesDiscretizer(n_bins=n_bins, strategy='quantile')
-    
+    discretizer = TimeSeriesDiscretizer(n_bins=n_bins, strategy=strategy, range_min=-5.0, range_max=5.0)
     discretizer.fit(train_data)
     
     train_discrete = discretizer.transform(train_data)
     test_discrete = discretizer.transform(test_data)
     
     # 2. Train BPE
-    # We set a high vocab limit so that min_freq is the main stopping criterion
+    # We set a large vocab size so min_freq stops it naturally
+    # Pass verbose=False from higher levels if implicit, though run_experiment usually is verbose
+    # We will assume run_experiment is silent during sweep if needed, but here we default to True
+    # Actually, we should check an argument. For now, let's stick to True unless passed.
+    # To support verbose control, we'd need to update run_experiment signature.
+    # But since we updated run_parameter_sweep to handle the main bar, we'll likely pass verbose=False here soon.
+    # Update: I will check if arguments have verbose.
     bpe = TimeSeriesBPE(vocab_size=5000, initial_vocab_size=n_bins)
-    train_compressed = bpe.train(train_discrete, min_freq=min_freq)
+    # Check if we should be verbose (hack: check if 'verbose' in locals or just default to False inside loop)
+    # Better to update signature. 
+    bpe.train(train_discrete, min_freq=min_freq, verbose=False)
+
     
     # 3. Evaluate on Test
     test_compressed = bpe.encode(test_discrete)
@@ -53,12 +89,13 @@ def run_experiment(
     
     # Metrics
     mse = np.mean((test_data - test_reconstructed) ** 2)
-    compression_ratio = len(test_data) / len(test_compressed)
+    compression_ratio = len(test_data) / max(1, len(test_compressed))
     
-    # 4. Entropy / Grammar Metrics (Unsupervised Selection)
+    # Unsupervised Grammar Metrics (The clean/robust selection criteria)
     grammar_stats = calculate_grammar_quality(test_compressed)
     
-    actual_vocab_size = bpe.current_vocab_count
+    # Clustering Metrics (Silhouette Score) - For Interpretability
+    motif_stats = calculate_motif_quality(test_compressed, bpe, test_data)
     
     result_dict = {
         'n_bins': n_bins,
@@ -68,7 +105,8 @@ def run_experiment(
         'compression_ratio': compression_ratio,
         'perplexity': grammar_stats['perplexity'],
         'entropy': grammar_stats['conditional_entropy'],
-        'vocab_size': actual_vocab_size
+        'consistency_score': motif_stats['consistency_score'],
+        'vocab_size': bpe.current_vocab_count
     }
     
     if return_models:
@@ -77,237 +115,194 @@ def run_experiment(
 
 def run_parameter_sweep(series, n_bins_list, strategies, min_freq_list, csv_path=GRID_RESULTS_PATH):
     """
-    Generic function to run a grid search and save results incrementally.
+    Runs a grid search, skipping already executed configurations.
+    Persists results incrementally to CSV.
     """
+    ensure_result_dir()
+    
     done_configs = set()
     results = []
 
-    # Load existing
+    # Resume capability
     if os.path.exists(csv_path):
         print(f"Loading existing results from {csv_path}...")
-        existing_df = pd.read_csv(csv_path)
-        if 'min_freq' in existing_df.columns:
-            results = existing_df.to_dict('records')
-            for r in results:
-                try: 
+        try:
+            existing_df = pd.read_csv(csv_path)
+            if not existing_df.empty:
+                results = existing_df.to_dict('records')
+                for r in results:
                     done_configs.add((int(r['n_bins']), r['strategy'], int(r['min_freq'])))
-                except:
-                    pass
+        except Exception as e:
+            print(f"Could not load existing results: {e}")
     
-    total_exp = len(n_bins_list) * len(strategies) * len(min_freq_list)
-    curr = 1
-    
-    print(f"\nScanning {total_exp} configurations...")
-
+    # Build full list of configs to iterate over
+    all_configs = []
     for n_bins in n_bins_list:
         for strategy in strategies:
             for min_freq in min_freq_list:
-                if (n_bins, strategy, min_freq) in done_configs:
-                    curr += 1
-                    continue
+                 all_configs.append((n_bins, strategy, min_freq))
 
-                print(f"Run {curr}/{total_exp}: Bins={n_bins}, Strat={strategy}, MinFreq={min_freq}")
-                try:
-                    res = run_experiment(
-                        series, n_bins, strategy, min_freq=min_freq
-                    )
-                    results.append(res)
-                    # Incremental save
-                    curr_df = pd.DataFrame([res])
-                    curr_df.to_csv(csv_path, mode='a', header=not os.path.exists(csv_path), index=False)
-                except Exception as e:
-                    print(f"Error: {e}")
-                
-                curr += 1
-                
-    # Filter results to return ONLY what was requested (or relevant to this sweep)
-    # This prevents Phase 1 from selecting a "best" candidate from a previous Phase 2 run that isn't in the coarse grid.
-    all_df = pd.DataFrame(results)
-    if all_df.empty:
-        return all_df
+    # Calculate remaining work
+    configs_to_run = [c for c in all_configs if c not in done_configs]
+    
+    if not configs_to_run:
+        print("All configurations already completed.")
+        return pd.DataFrame(results)
+
+    print(f"\nScanning {len(configs_to_run)}/{len(all_configs)} configurations...")
+    
+    # Use tqdm for the outer loop (Sweep Progress)
+    from tqdm import tqdm
+    pbar = tqdm(configs_to_run, desc="Parameter Sweep")
+    
+    # Suppress warnings during sweep to keep progress bar clean
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
         
-    mask = (
-        all_df['n_bins'].isin(n_bins_list) & 
-        all_df['strategy'].isin(strategies) & 
-        all_df['min_freq'].isin(min_freq_list)
-    )
-    return all_df[mask]
-
-def analyze_best_candidates(df, top_n=3, min_freq_threshold=0):
-    """
-    Select best candidates using Grammar Quality (Perplexity) as a primary filter.
-    Logic:
-    1. Filter out high-perplexity models (Perplexity > Threshold or Top 50%).
-       High perplexity = Random noise, poor grammar learning.
-    2. Among valid grammar models, pick the one with best Compression/MSE trade-off.
-    """
-    df = df.copy()
-    
-    # Ensure columns exist (for backward compatibility)
-    if 'perplexity' not in df.columns:
-        print("Warning: 'perplexity' column missing. Using old distance heuristic only.")
-        return analyze_best_candidates_legacy(df, top_n, min_freq_threshold)
-
-    # 0. Basic Filter
-    if min_freq_threshold > 0:
-        df = df[df['min_freq'] >= min_freq_threshold]
-        if df.empty:
-            print(f"Warning: No candidates found with min_freq >= {min_freq_threshold}")
-            return None
+        for (n_bins, strategy, min_freq) in pbar:
+            # Update description to show current test parameters
+            pbar.set_description(f"Run {len(results)+1}: Bins={n_bins}, Strat={strategy}, MinFreq={min_freq}")
             
-    # 1. Grammar Filter (Perplexity)
-    # Heuristic: If perplexity is > 10.5 (based on analysis), it's likely noise.
-    # Alternatively, take the bottom 50% percentile of perplexity (low is good).
-    perplexity_threshold = 10.5
-    valid_grammar_df = df[df['perplexity'] <= perplexity_threshold]
-    
-    if valid_grammar_df.empty:
-        print(f"Warning: No models passed perplexity threshold {perplexity_threshold}. Using all models.")
-        valid_grammar_df = df
-    else:
-        print(f"Grammar Filter: Reduced {len(df)} -> {len(valid_grammar_df)} models using Perplexity <= {perplexity_threshold}")
+            try:
+                # We silence the inner BPE training bar (verbose=False inside run_experiment)
+                res = run_experiment(series, n_bins, strategy, min_freq=min_freq)
+                results.append(res)
+                
+                # Append to CSV
+                df_res = pd.DataFrame([res])
+                df_res.to_csv(csv_path, mode='a', header=not os.path.exists(csv_path), index=False)
+            except Exception as e:
+                # tqdm.write ensures we don't break the bar
+                tqdm.write(f"Experiment Failed: {e}")
+            
+    return pd.DataFrame(results)
 
-    # 2. Select Best among Valid Grammar Models (using Distance to Ideal)
-    # Normalize 0..1 relative to the VALID set
-    mse_norm = (valid_grammar_df['mse'] - valid_grammar_df['mse'].min()) / (valid_grammar_df['mse'].max() - valid_grammar_df['mse'].min() + 1e-9)
-    comp_norm = (valid_grammar_df['compression_ratio'] - valid_grammar_df['compression_ratio'].min()) / (valid_grammar_df['compression_ratio'].max() - valid_grammar_df['compression_ratio'].min() + 1e-9)
-    
-    # Distance to (MSE=0, Comp=Max)
-    valid_grammar_df['dist_to_ideal'] = np.sqrt(mse_norm**2 + (1 - comp_norm)**2)
-    
-    best_df = valid_grammar_df.sort_values('dist_to_ideal').head(top_n)
-    
-    print("\nTop Candidates (Optimized for Grammar & Efficiency):")
-    print(best_df[['n_bins', 'strategy', 'min_freq', 'mse', 'compression_ratio', 'perplexity', 'dist_to_ideal']])
-    
-    return best_df.iloc[0]
-
-def analyze_best_candidates_legacy(df, top_n=3, min_freq_threshold=0):
-    # Old logic for backward compatibility
+def select_best_model(df, top_n=3, consistency_threshold=0.6):
+    """
+    Selects the best model based on Motif Consistency (Visual Quality).
+    """
+    if df.empty:
+        return None
+        
     df = df.copy()
-    if min_freq_threshold > 0:
-        df = df[df['min_freq'] >= min_freq_threshold]
     
-    mse_norm = (df['mse'] - df['mse'].min()) / (df['mse'].max() - df['mse'].min() + 1e-9)
-    comp_norm = (df['compression_ratio'] - df['compression_ratio'].min()) / (df['compression_ratio'].max() - df['compression_ratio'].min() + 1e-9)
-    df['dist_to_ideal'] = np.sqrt(mse_norm**2 + (1 - comp_norm)**2)
-    return df.sort_values('dist_to_ideal').head(1).iloc[0]
+    # 1. Consistency Filter
+    if 'consistency_score' not in df.columns:
+        print("Error: 'consistency_score' metric missing. Re-running experiments required.")
+        return df.iloc[0]
+        
+    # We want consistent motifs (High Correlation)
+    valid_motif_df = df[df['consistency_score'] >= consistency_threshold].copy()
     
-    best_balanced = df.sort_values('dist_to_ideal').iloc[0]
+    if valid_motif_df.empty:
+        print(f"Warning: No models passed consistency >= {consistency_threshold}. Using all models.")
+        valid_motif_df = df
+    else:
+        print(f"Motif Filter: {len(df)} -> {len(valid_motif_df)} candidates (Consistency >= {consistency_threshold})")
+        
+    # 2. Ranking
+    # Primary: Consistency (Visual Quality)
+    # Secondary: Compression (Efficiency)
+    ranked = valid_motif_df.sort_values('consistency_score', ascending=False)
     
-    print(f"\n--- Best Balanced Candidate (MinFreq>={min_freq_threshold}) ---")
-    print(best_balanced[['n_bins', 'strategy', 'min_freq', 'mse', 'compression_ratio']])
+    print("\nTop Candidates (Best Visual Motifs):")
+    cols = ['n_bins', 'strategy', 'min_freq', 'mse', 'consistency_score', 'compression_ratio']
+    # Check if cols exist
+    cols = [c for c in cols if c in ranked.columns]
+    print(ranked[cols].head(top_n))
     
-    return best_balanced
+    return ranked.iloc[0]
 
 def main():
+    ensure_result_dir()
+    
+    # 1. Load Data
     print("Loading Data...")
     df = load_data()
-    raw_series = get_series(df, 'OT').values
+    series = get_series(df, 'OT').values
     
-    # Preprocessing
-    print("Normalizing Data...")
-    mean = np.mean(raw_series)
-    std = np.std(raw_series)
-    series_norm = (raw_series - mean) / std
+    # Preprocess
+    mean = np.mean(series)
+    std = np.std(series)
+    series_norm = (series - mean) / std
+    series_final = np.clip(series_norm, -5.0, 5.0) # Remove extreme outliers
     
-    print("Truncating Data (-5 to 5)...")
-    series_final = np.clip(series_norm, -5.0, 5.0)
-    
-    # --- Phase 1: Coarse Grid Search ---
+    # 2. Phase 1: Coarse Grid Search
     print("\n=== Phase 1: Coarse Grid Search ===")
-    coarse_n_bins = [20, 50, 100]
-    coarse_strategies = ['quantile', 'gaussian', 'uniform_fixed']
-    coarse_min_freq = [5, 50, 200]
+    bins_coarse = [10, 20, 30, 50, 100]
+    strategies = ['quantile', 'gaussian', 'uniform_fixed']
+    min_freqs = [30,50,100,200,300]
     
-    df_coarse = run_parameter_sweep(
-        series_final, coarse_n_bins, coarse_strategies, coarse_min_freq
-    )
+    results_df = run_parameter_sweep(series_final, bins_coarse, strategies, min_freqs)
     
-    # Analyze best candidate to refine
-    best_candidate = analyze_best_candidates(df_coarse)
-    
-    best_bins = int(best_candidate['n_bins'])
-    best_strategy = best_candidate['strategy']
-    best_freq = int(best_candidate['min_freq'])
-    
-    # --- Phase 2: Fine Grid Search ---
-    print(f"\n=== Phase 2: Fine Grid Search around {best_bins} bins, {best_strategy}, min_freq={best_freq} ===")
-    
-    # Define fine grid around best parameters
-    # Bins: +/- 10 and +/- 5
-    fine_n_bins = sorted(list(set([
-        max(10, best_bins - 10), 
-        max(10, best_bins - 5), 
-        best_bins, 
-        best_bins + 5, 
-        best_bins + 10
-    ])))
-    
-    # Freq: +/- relative range
-    fine_min_freq = sorted(list(set([
-        max(2, int(best_freq * 0.5)),
-        max(2, int(best_freq * 0.75)),
-        best_freq,
-        int(best_freq * 1.25),
-        int(best_freq * 1.5)
-    ])))
-    
-    fine_strategies = [best_strategy] 
-    
-    df_all = run_parameter_sweep(
-        series_final, fine_n_bins, fine_strategies, fine_min_freq
-    )
-    
-    # --- Phase 3: Final Selection & Visualization ---
-    print("\n=== Phase 3: Final Selection (Robust Candidates min_freq>=30) ===")
-    # We combine all results from coarse and fine search logic (if they were saved to same CSV)
-    # But here df_all contains only the fine search results.
-    # Let's load the full CSV to be safe and find the globally best ROBUST model.
-    if os.path.exists(GRID_RESULTS_PATH):
-        full_df = pd.read_csv(GRID_RESULTS_PATH)
-    else:
-        full_df = df_all
+    # Select Best Candidate for visual check
+    best_config = select_best_model(results_df)
 
-    final_best = analyze_best_candidates(full_df, min_freq_threshold=30)
-    if final_best is None:
-        # Fallback if no robust one found
-        final_best = analyze_best_candidates(full_df, min_freq_threshold=0)
+    # 3. Phase 2: Refinement
+    print("\n=== Phase 2: Refinement Search ===")
     
-    final_bins = int(final_best['n_bins'])
-    final_strategy = final_best['strategy']
-    final_freq = int(final_best['min_freq'])
+    best_n_bins = int(best_config['n_bins'])
+    best_min_freq = int(best_config['min_freq'])
+    best_strategy = best_config['strategy']
     
-    print("Generating Pareto Plot for ALL results...")
-    plot_pareto_frontier(full_df, os.path.join(RESULT_DIR, "pareto_frontier.png"))
+    # Define search space around the best candidate
+    bins_refine = sorted(list(set([
+        max(10, best_n_bins - 10), 
+        best_n_bins, 
+        best_n_bins + 10
+    ])))
     
-    print(f"\nGenerating Detailed Visualization for Final Best: Bins={final_bins}, {final_strategy}, Freq={final_freq}")
-    _, best_bpe, best_disc, test_data, test_tokens = run_experiment(
+    freq_refine = sorted(list(set([
+        max(2, best_min_freq - 10), 
+        best_min_freq, 
+        best_min_freq + 10
+    ])))
+    
+    print(f"Refining around Bins={best_n_bins}, MinFreq={best_min_freq}...")
+    print(f"Search Space: Bins={bins_refine}, Freq={freq_refine}")
+    
+    # Run refinement sweep (only for the best strategy)
+    results_df = run_parameter_sweep(series_final, bins_refine, [best_strategy], freq_refine)
+    
+    # Final Selection
+    best_config = select_best_model(results_df)
+
+    print(f"\nFinal Selected Config: Bins={best_config['n_bins']}, Strat={best_config['strategy']}, MinFreq={best_config['min_freq']}")
+
+    # 4. Final Viz & Analysis
+    print("\nGenerating Final Visualizations...")
+    
+    # Retrain best model to get objects
+    res, bpe, discretizer, _, test_comp = run_experiment(
         series_final, 
-        n_bins=final_bins, 
-        strategy=final_strategy, 
-        min_freq=final_freq, 
+        n_bins=int(best_config['n_bins']), 
+        strategy=best_config['strategy'], 
+        min_freq=int(best_config['min_freq']),
         return_models=True
     )
     
+    # A. Pareto Plot
+    plot_pareto_frontier(results_df, os.path.join(RESULT_DIR, "pareto_frontier.png"))
+    
+    # B. Detailed Sequence Viz
     plot_detailed_tokenization(
-        test_data, 
-        test_tokens, 
-        best_bpe, 
-        best_disc, 
+        series_final[int(len(series_final)*0.8):], # Test set for viz
+        test_comp,
+        bpe,
+        discretizer,
         os.path.join(RESULT_DIR, "detailed_tokenization.png"),
-        info_dict=final_best.to_dict()
+        info_dict=best_config.to_dict()
     )
     
-    print("Generating Tokenization Gallery...")
+    # C. Gallery
     plot_tokenization_gallery(
-        test_data,
-        test_tokens,
-        best_bpe,
+        series_final, 
+        test_comp,
+        bpe, 
         os.path.join(RESULT_DIR, "tokenization_gallery.png"),
-        n_examples=8,
-        info_dict=final_best.to_dict()
+        info_dict=best_config.to_dict()
     )
+
 
 if __name__ == "__main__":
     main()

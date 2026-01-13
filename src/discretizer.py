@@ -1,3 +1,18 @@
+"""
+Time Series Discretization Module.
+----------------------------------
+This module handles the conversion of continuous time series data into discrete
+symbolic sequences (tokens), supporting multiple strategies like SAX (Gaussian),
+Uniform, and Quantile binning.
+
+Public Classes:
+- TimeSeriesDiscretizer: 
+    Scikit-learn style transformer (fit/transform/inverse_transform).
+    Strategies: 'quantile', 'uniform', 'uniform_fixed', 'gaussian'.
+
+Dependencies: numpy, sklearn, scipy
+"""
+
 import numpy as np
 from sklearn.preprocessing import KBinsDiscretizer
 from scipy.stats import norm
@@ -26,17 +41,11 @@ class TimeSeriesDiscretizer:
         elif self.strategy == 'gaussian':
             # Theoretical Normal Distribution Clamped to range
             # We assume X is already normalized (N(0,1)).
-            # We want equal probability mass under the Gaussian curve.
-            # linspace(0, 1, n_bins+1) gives cumulative probabilities.
-            # norm.ppf gives the value (quantile) for that probability.
             probs = np.linspace(0, 1, self.n_bins + 1)
             # Clip probabilities slightly to avoid inf at 0 and 1
             epsilon = 1e-6
             probs = np.clip(probs, epsilon, 1-epsilon)
             self.bin_edges_ = norm.ppf(probs)
-            # Ensure edges cover the truncated range or data range if needed
-            # Usually SAX open-ends the first and last bin (-inf, +inf)
-            # but for reconstruction we need concrete centers.
             
         elif self.strategy == 'uniform':
              if X.ndim == 1:
@@ -49,6 +58,8 @@ class TimeSeriesDiscretizer:
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         # Pre-clipping for fixed/gaussian ensures stability
+        # Important: Reshape is handled inside methods or here if generic
+        
         X_clipped = np.clip(X, self.range_min, self.range_max)
         
         if self.strategy in ['uniform_fixed', 'gaussian']:
@@ -64,11 +75,6 @@ class TimeSeriesDiscretizer:
     def inverse_transform(self, X_discrete: np.ndarray) -> np.ndarray:
         if self.strategy in ['uniform_fixed', 'gaussian']:
             # Decode using bin centers
-            # For Gaussian, the probabilistic center is strictly NOT the geometric center of edges
-            # mean value of truncated normal in that interval.
-            # But geometric center is a fine approximation for visualization.
-            # Let's use geometric center of edges for simplicity, 
-            # except for outer bins which might be large.
             centers = (self.bin_edges_[:-1] + self.bin_edges_[1:]) / 2
             return centers[X_discrete]
         else:

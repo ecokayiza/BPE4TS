@@ -177,9 +177,15 @@ def run_parameter_sweep(series, n_bins_list, strategies, min_freq_list, csv_path
             
     return pd.DataFrame(results)
 
-def select_best_model(df, top_n=3, consistency_threshold=0.6):
+def select_best_model(df, top_n=3, consistency_threshold=0.6, perplexity_threshold=None):
     """
-    Selects the best model based on Motif Consistency (Visual Quality).
+    Selects the best model based on Motif Consistency (Visual Quality) and Perplexity (Grammar Quality).
+    
+    Args:
+        df: DataFrame with experiment results.
+        top_n: Number of top candidates to display.
+        consistency_threshold: Minimum consistency score (higher is better).
+        perplexity_threshold: Maximum perplexity (lower is better). If None, uses median.
     """
     if df.empty:
         return None
@@ -190,23 +196,49 @@ def select_best_model(df, top_n=3, consistency_threshold=0.6):
     if 'consistency_score' not in df.columns:
         print("Error: 'consistency_score' metric missing. Re-running experiments required.")
         return df.iloc[0]
+    
+    if 'perplexity' not in df.columns:
+        print("Error: 'perplexity' metric missing. Re-running experiments required.")
+        return df.iloc[0]
         
     # We want consistent motifs (High Correlation)
-    valid_motif_df = df[df['consistency_score'] >= consistency_threshold].copy()
+    valid_df = df[df['consistency_score'] >= consistency_threshold].copy()
     
-    if valid_motif_df.empty:
+    if valid_df.empty:
         print(f"Warning: No models passed consistency >= {consistency_threshold}. Using all models.")
-        valid_motif_df = df
+        valid_df = df.copy()
     else:
-        print(f"Motif Filter: {len(df)} -> {len(valid_motif_df)} candidates (Consistency >= {consistency_threshold})")
-        
-    # 2. Ranking
-    # Primary: Consistency (Visual Quality)
-    # Secondary: Compression (Efficiency)
-    ranked = valid_motif_df.sort_values('consistency_score', ascending=False)
+        print(f"Motif Filter: {len(df)} -> {len(valid_df)} candidates (Consistency >= {consistency_threshold})")
     
-    print("\nTop Candidates (Best Visual Motifs):")
-    cols = ['n_bins', 'strategy', 'min_freq', 'mse', 'consistency_score', 'compression_ratio']
+    # 2. Perplexity Filter (Low perplexity = good grammar structure)
+    if perplexity_threshold is None:
+        perplexity_threshold = valid_df['perplexity'].median()
+    
+    valid_ppl_df = valid_df[valid_df['perplexity'] <= perplexity_threshold].copy()
+    
+    if valid_ppl_df.empty:
+        print(f"Warning: No models passed perplexity <= {perplexity_threshold:.2f}. Using consistency-filtered models.")
+        valid_ppl_df = valid_df
+    else:
+        print(f"Perplexity Filter: {len(valid_df)} -> {len(valid_ppl_df)} candidates (Perplexity <= {perplexity_threshold:.2f})")
+        
+    # 3. Ranking: Combined Score
+    # Normalize metrics for combined ranking
+    # Consistency: higher is better (0-1 scale already)
+    # Perplexity: lower is better (need to invert)
+    ppl_min, ppl_max = valid_ppl_df['perplexity'].min(), valid_ppl_df['perplexity'].max()
+    if ppl_max > ppl_min:
+        valid_ppl_df['ppl_score'] = 1 - (valid_ppl_df['perplexity'] - ppl_min) / (ppl_max - ppl_min)
+    else:
+        valid_ppl_df['ppl_score'] = 1.0
+    
+    # Combined score: weighted average (consistency 50%, perplexity 50%)
+    valid_ppl_df['combined_score'] = 0.5 * valid_ppl_df['consistency_score'] + 0.5 * valid_ppl_df['ppl_score']
+    
+    ranked = valid_ppl_df.sort_values('combined_score', ascending=False)
+    
+    print("\nTop Candidates (Best Visual Motifs + Grammar Quality):")
+    cols = ['n_bins', 'strategy', 'min_freq', 'mse', 'consistency_score', 'perplexity', 'compression_ratio']
     # Check if cols exist
     cols = [c for c in cols if c in ranked.columns]
     print(ranked[cols].head(top_n))
@@ -229,7 +261,7 @@ def main():
     
     # 2. Phase 1: Coarse Grid Search
     print("\n=== Phase 1: Coarse Grid Search ===")
-    bins_coarse = [10, 20, 30, 50, 100]
+    bins_coarse = [20, 30, 50, 100]
     strategies = ['quantile', 'gaussian', 'uniform_fixed']
     min_freqs = [30,50,100,200,300]
     

@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import networkx as nx
+import random
 from src.data_loader import load_data, get_series
 from src.discretizer import TimeSeriesDiscretizer
 from src.tokenizer import TimeSeriesBPE
@@ -27,27 +28,22 @@ def viz_token_example():
     train_discrete = discretizer.transform(series_final)
     
     # 3. Train BPE
+    # Use higher min_freq to match robust configuration
+    min_freq = 50 
     bpe = TimeSeriesBPE(vocab_size=5000, initial_vocab_size=n_bins)
-    compressed = bpe.train(train_discrete, min_freq=2)
+    compressed = bpe.train(train_discrete, min_freq=min_freq)
     
-    # 4. Find the target complex token (Depth >= 4)
-    def get_depth(tid):
-        if tid < bpe.initial_vocab_size: return 0
-        if tid not in bpe.rules: return 0
-        l, r = bpe.rules[tid]
-        return max(get_depth(l), get_depth(r)) + 1
-        
-    used_tokens = set(compressed)
-    sorted_tokens = sorted(list(used_tokens), reverse=True)
+    # 4. Select a random complex token
+    used_tokens = list(set(compressed))
+    # Filter for non-leaf tokens to make it interesting
+    complex_tokens = [t for t in used_tokens if t >= bpe.initial_vocab_size]
     
-    target_token = None
-    for t in sorted_tokens:
-        if get_depth(t) >= 4:
-            target_token = t
-            break
-            
-    if target_token is None:
-        target_token = sorted_tokens[0]
+    if complex_tokens:
+        target_token = random.choice(complex_tokens)
+        print(f"Randomly selected complex Token ID: {target_token}")
+    else:
+        print("No complex tokens found with current settings.")
+        target_token = used_tokens[0] if used_tokens else 0
         
     print(f"Visualizing Token ID: {target_token}")
 

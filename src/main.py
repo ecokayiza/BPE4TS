@@ -126,13 +126,19 @@ def run_parameter_sweep(series, n_bins_list, strategies, min_freq_list, csv_path
     )
     return all_df[mask]
 
-def analyze_best_candidates(df, top_n=3):
+def analyze_best_candidates(df, top_n=3, min_freq_threshold=0):
     """
     Select best candidates based on a heuristic score.
     Heuristic: Minimize MSE while maximizing Compression.
     Distance from Ideal Point (0 MSE, Max Compression) method.
     """
     df = df.copy()
+    
+    if min_freq_threshold > 0:
+        df = df[df['min_freq'] >= min_freq_threshold]
+        if df.empty:
+            print(f"Warning: No candidates found with min_freq >= {min_freq_threshold}")
+            return None
     
     # Normalize 0..1
     mse_norm = (df['mse'] - df['mse'].min()) / (df['mse'].max() - df['mse'].min() + 1e-9)
@@ -144,7 +150,7 @@ def analyze_best_candidates(df, top_n=3):
     
     best_balanced = df.sort_values('dist_to_ideal').iloc[0]
     
-    print("\n--- Best Balanced Candidate ---")
+    print(f"\n--- Best Balanced Candidate (MinFreq>={min_freq_threshold}) ---")
     print(best_balanced[['n_bins', 'strategy', 'min_freq', 'mse', 'compression_ratio']])
     
     return best_balanced
@@ -209,15 +215,26 @@ def main():
     )
     
     # --- Phase 3: Final Selection & Visualization ---
-    print("\n=== Phase 3: Final Selection ===")
-    final_best = analyze_best_candidates(df_all)
+    print("\n=== Phase 3: Final Selection (Robust Candidates min_freq>=30) ===")
+    # We combine all results from coarse and fine search logic (if they were saved to same CSV)
+    # But here df_all contains only the fine search results.
+    # Let's load the full CSV to be safe and find the globally best ROBUST model.
+    if os.path.exists(GRID_RESULTS_PATH):
+        full_df = pd.read_csv(GRID_RESULTS_PATH)
+    else:
+        full_df = df_all
+
+    final_best = analyze_best_candidates(full_df, min_freq_threshold=30)
+    if final_best is None:
+        # Fallback if no robust one found
+        final_best = analyze_best_candidates(full_df, min_freq_threshold=0)
     
     final_bins = int(final_best['n_bins'])
     final_strategy = final_best['strategy']
     final_freq = int(final_best['min_freq'])
     
     print("Generating Pareto Plot for ALL results...")
-    plot_pareto_frontier(df_all, os.path.join(RESULT_DIR, "pareto_frontier.png"))
+    plot_pareto_frontier(full_df, os.path.join(RESULT_DIR, "pareto_frontier.png"))
     
     print(f"\nGenerating Detailed Visualization for Final Best: Bins={final_bins}, {final_strategy}, Freq={final_freq}")
     _, best_bpe, best_disc, test_data, test_tokens = run_experiment(

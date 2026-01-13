@@ -3,6 +3,7 @@ import pandas as pd
 from src.data_loader import load_data, get_series
 from src.discretizer import TimeSeriesDiscretizer
 from src.tokenizer import TimeSeriesBPE
+from src.metrics_entropy import calculate_grammar_quality
 from src.visualization import plot_pareto_frontier, plot_detailed_tokenization, plot_tokenization_gallery
 import os
 
@@ -54,6 +55,9 @@ def run_experiment(
     mse = np.mean((test_data - test_reconstructed) ** 2)
     compression_ratio = len(test_data) / len(test_compressed)
     
+    # 4. Entropy / Grammar Metrics (Unsupervised Selection)
+    grammar_stats = calculate_grammar_quality(test_compressed)
+    
     actual_vocab_size = bpe.current_vocab_count
     
     result_dict = {
@@ -61,7 +65,10 @@ def run_experiment(
         'strategy': strategy,
         'min_freq': min_freq,
         'mse': mse,
-        'compression_ratio': compression_ratio
+        'compression_ratio': compression_ratio,
+        'perplexity': grammar_stats['perplexity'],
+        'entropy': grammar_stats['conditional_entropy'],
+        'vocab_size': actual_vocab_size
     }
     
     if return_models:
@@ -128,25 +135,63 @@ def run_parameter_sweep(series, n_bins_list, strategies, min_freq_list, csv_path
 
 def analyze_best_candidates(df, top_n=3, min_freq_threshold=0):
     """
-    Select best candidates based on a heuristic score.
-    Heuristic: Minimize MSE while maximizing Compression.
-    Distance from Ideal Point (0 MSE, Max Compression) method.
+    Select best candidates using Grammar Quality (Perplexity) as a primary filter.
+    Logic:
+    1. Filter out high-perplexity models (Perplexity > Threshold or Top 50%).
+       High perplexity = Random noise, poor grammar learning.
+    2. Among valid grammar models, pick the one with best Compression/MSE trade-off.
     """
     df = df.copy()
     
+    # Ensure columns exist (for backward compatibility)
+    if 'perplexity' not in df.columns:
+        print("Warning: 'perplexity' column missing. Using old distance heuristic only.")
+        return analyze_best_candidates_legacy(df, top_n, min_freq_threshold)
+
+    # 0. Basic Filter
     if min_freq_threshold > 0:
         df = df[df['min_freq'] >= min_freq_threshold]
         if df.empty:
             print(f"Warning: No candidates found with min_freq >= {min_freq_threshold}")
             return None
+            
+    # 1. Grammar Filter (Perplexity)
+    # Heuristic: If perplexity is > 10.5 (based on analysis), it's likely noise.
+    # Alternatively, take the bottom 50% percentile of perplexity (low is good).
+    perplexity_threshold = 10.5
+    valid_grammar_df = df[df['perplexity'] <= perplexity_threshold]
     
-    # Normalize 0..1
+    if valid_grammar_df.empty:
+        print(f"Warning: No models passed perplexity threshold {perplexity_threshold}. Using all models.")
+        valid_grammar_df = df
+    else:
+        print(f"Grammar Filter: Reduced {len(df)} -> {len(valid_grammar_df)} models using Perplexity <= {perplexity_threshold}")
+
+    # 2. Select Best among Valid Grammar Models (using Distance to Ideal)
+    # Normalize 0..1 relative to the VALID set
+    mse_norm = (valid_grammar_df['mse'] - valid_grammar_df['mse'].min()) / (valid_grammar_df['mse'].max() - valid_grammar_df['mse'].min() + 1e-9)
+    comp_norm = (valid_grammar_df['compression_ratio'] - valid_grammar_df['compression_ratio'].min()) / (valid_grammar_df['compression_ratio'].max() - valid_grammar_df['compression_ratio'].min() + 1e-9)
+    
+    # Distance to (MSE=0, Comp=Max)
+    valid_grammar_df['dist_to_ideal'] = np.sqrt(mse_norm**2 + (1 - comp_norm)**2)
+    
+    best_df = valid_grammar_df.sort_values('dist_to_ideal').head(top_n)
+    
+    print("\nTop Candidates (Optimized for Grammar & Efficiency):")
+    print(best_df[['n_bins', 'strategy', 'min_freq', 'mse', 'compression_ratio', 'perplexity', 'dist_to_ideal']])
+    
+    return best_df.iloc[0]
+
+def analyze_best_candidates_legacy(df, top_n=3, min_freq_threshold=0):
+    # Old logic for backward compatibility
+    df = df.copy()
+    if min_freq_threshold > 0:
+        df = df[df['min_freq'] >= min_freq_threshold]
+    
     mse_norm = (df['mse'] - df['mse'].min()) / (df['mse'].max() - df['mse'].min() + 1e-9)
-    # For compression, higher is better. We invert it to 'distance from best' or use 1-norm.
     comp_norm = (df['compression_ratio'] - df['compression_ratio'].min()) / (df['compression_ratio'].max() - df['compression_ratio'].min() + 1e-9)
-    
-    # Distance to (MSE=0, Comp=1) in normalized space
     df['dist_to_ideal'] = np.sqrt(mse_norm**2 + (1 - comp_norm)**2)
+    return df.sort_values('dist_to_ideal').head(1).iloc[0]
     
     best_balanced = df.sort_values('dist_to_ideal').iloc[0]
     
